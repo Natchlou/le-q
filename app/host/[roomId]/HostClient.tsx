@@ -14,6 +14,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useRouter } from "next/navigation";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 type Props = {
   initialRoom: Room;
@@ -36,17 +38,43 @@ export default function HostClient({ initialRoom, roomId }: Props) {
   const router = useRouter();
 
   useEffect(() => {
-    fetch("/questions.json")
+    fetch("/questions-" + roomId + ".json")
       .then((res) => res.json())
       .then((data) => setJsonQuestions(data))
-      .catch((err) => console.error("Erreur chargement JSON", err));
-  }, []);
+      .catch(() => setJsonQuestions([]));
+  }, [roomId]);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files?.length) return;
+    const file = e.target.files[0];
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("roomId", roomId);
+
+    try {
+      const res = await fetch("/api/upload-questions", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (res.ok) {
+        showNotification("✅ Questions importées !");
+        fetch("/questions-" + roomId + ".json")
+          .then((res) => res.json())
+          .then((data) => setJsonQuestions(data));
+      } else {
+        showNotification("⚠️ Erreur lors de l'import");
+      }
+    } catch (error) {
+      console.error("Upload error:", error);
+      showNotification("⚠️ Erreur d'upload");
+    }
+  };
 
   const removeQuestionFromList = (text: string) => {
     setJsonQuestions((prev) => prev.filter((q) => q.text !== text));
   };
 
-  // Fonction pour afficher un message
   const showNotification = (message: string) => {
     setNotification(message);
     setTimeout(() => setNotification(null), 2000);
@@ -58,15 +86,13 @@ export default function HostClient({ initialRoom, roomId }: Props) {
 
   const loadAnswersForQuestion = useCallback(async (questionId: string) => {
     try {
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from("answers")
         .select("*, player:players(*)")
         .eq("question_id", questionId)
         .order("submitted_at", { ascending: true });
-      if (error) throw error;
       setAnswers(data || []);
-    } catch (error) {
-      console.error("Erreur chargement réponses", error);
+    } catch {
       setAnswers([]);
     }
   }, []);
@@ -105,8 +131,8 @@ export default function HostClient({ initialRoom, roomId }: Props) {
           await loadAnswersForQuestion(questionData.id);
         }
       }
-    } catch (error) {
-      console.error("Erreur chargement salle", error);
+    } catch {
+      setIsLoading(false);
     } finally {
       setIsLoading(false);
     }
@@ -115,83 +141,6 @@ export default function HostClient({ initialRoom, roomId }: Props) {
   useEffect(() => {
     loadRoomData();
   }, [loadRoomData]);
-
-  useEffect(() => {
-    if (!roomId) return;
-
-    const playersChannel = supabase
-      .channel(`players-${roomId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "players",
-          filter: `room_id=eq.${roomId}`,
-        },
-        (payload: any) => {
-          supabase
-            .from("players")
-            .select("*")
-            .eq("room_id", roomId)
-            .order("score", { ascending: false })
-            .then(({ data }) => {
-              if (data) setPlayers(data);
-            });
-        }
-      )
-      .subscribe();
-
-    const answersChannel = supabase
-      .channel(`answers-${roomId}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "answers" },
-        async (payload: any) => {
-          if (currentQuestion) {
-            const answerQuestionId =
-              payload.new?.question_id || payload.old?.question_id;
-            if (answerQuestionId === currentQuestion.id) {
-              await loadAnswersForQuestion(currentQuestion.id);
-            }
-          }
-        }
-      )
-      .subscribe();
-
-    const questionsChannel = supabase
-      .channel(`questions-${roomId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "questions",
-          filter: `room_id=eq.${roomId}`,
-        },
-        async (payload: any) => {
-          if (payload.eventType === "INSERT" && payload.new?.is_active) {
-            setCurrentQuestion(payload.new);
-            setAnswers([]);
-          } else if (
-            payload.eventType === "UPDATE" &&
-            !payload.new?.is_active
-          ) {
-            if (currentQuestion?.id === payload.new?.id) {
-              setCurrentQuestion(null);
-              setAnswers([]);
-            }
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(playersChannel);
-      supabase.removeChannel(answersChannel);
-      supabase.removeChannel(questionsChannel);
-    };
-  }, [roomId, loadAnswersForQuestion, currentQuestion]);
 
   const sendQuestion = async () => {
     if (!questionText.trim()) {
@@ -206,7 +155,7 @@ export default function HostClient({ initialRoom, roomId }: Props) {
           .eq("id", currentQuestion.id);
       }
 
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from("questions")
         .insert({
           room_id: roomId,
@@ -217,70 +166,52 @@ export default function HostClient({ initialRoom, roomId }: Props) {
         .select()
         .single();
 
-      if (error) throw error;
-
       removeQuestionFromList(questionText);
       setCurrentQuestion(data);
       setAnswers([]);
       setQuestionText("");
       setCorrectAnswer("");
       showNotification("Question envoyée !");
-    } catch (error) {
-      console.error("Erreur lors de l'envoi de la question:", error);
+    } catch {
       showNotification("Erreur lors de l'envoi de la question");
     }
   };
 
   const endGame = async () => {
-    if (!roomId) return;
-
     try {
-      // Suppression des réponses
       await supabase.from("answers").delete().eq("room_id", roomId);
-
-      // Suppression des questions
       await supabase.from("questions").delete().eq("room_id", roomId);
-
-      // Suppression des joueurs
       await supabase.from("players").delete().eq("room_id", roomId);
-
-      // (Optionnel) Suppression de la salle
       await supabase.from("rooms").delete().eq("id", roomId);
-
       setRoom(null);
       setPlayers([]);
       setCurrentQuestion(null);
       setAnswers([]);
-      showNotification("🎮 Partie terminée et données supprimées !");
       setIsGameEnded(true);
-    } catch (error) {
-      console.error("Erreur lors de la suppression :", error);
+      setJsonQuestions([]);
+      setQuestionText("");
+      setCorrectAnswer("");
+      showNotification("🎮 Partie terminée et données supprimées !");
+    } catch {
       showNotification("⚠️ Impossible de terminer la partie.");
     }
   };
 
   const markAnswerCorrect = async (answer: Answer) => {
     try {
-      const { error: answerError } = await supabase
+      await supabase
         .from("answers")
         .update({ is_correct: true })
         .eq("id", answer.id);
-
-      if (answerError) throw answerError;
-
-      const { error: playerError } = await supabase
+      await supabase
         .from("players")
         .update({ score: (answer.player?.score || 0) + 1 })
         .eq("id", answer.player_id);
-
-      if (playerError) throw playerError;
-
       await loadRoomData();
       showNotification(
         `🎉 ${answer.player?.pseudo} a donné la bonne réponse !`
       );
-    } catch (error) {
-      console.error("Erreur mise à jour score", error);
+    } catch {
       showNotification("Erreur mise à jour score");
     }
   };
@@ -294,29 +225,21 @@ export default function HostClient({ initialRoom, roomId }: Props) {
 
   const updatePlayerScore = async (playerId: string, amount: number) => {
     try {
-      const { data: playerData, error: playerError } = await supabase
+      const { data: playerData } = await supabase
         .from("players")
         .select("score")
         .eq("id", playerId)
         .single();
-
-      if (playerError) throw playerError;
-
       const newScore = (playerData?.score || 0) + amount;
-
-      const { error: updateError } = await supabase
+      await supabase
         .from("players")
         .update({ score: newScore })
         .eq("id", playerId);
-
-      if (updateError) throw updateError;
-
       setPlayers((prev) =>
         prev.map((p) => (p.id === playerId ? { ...p, score: newScore } : p))
       );
       showNotification("Score mis à jour !");
-    } catch (error) {
-      console.error("Erreur mise à jour score manuel:", error);
+    } catch {
       showNotification("Impossible de modifier le score.");
     }
   };
@@ -350,8 +273,7 @@ export default function HostClient({ initialRoom, roomId }: Props) {
               size="sm"
               className="bg-white/20 hover:bg-white/30 text-white border-white/30"
             >
-              <Copy className="h-4 w-4 mr-1" />
-              Copier
+              <Copy className="h-4 w-4 mr-1" /> Copier
             </Button>
             <Button
               onClick={endGame}
@@ -373,11 +295,19 @@ export default function HostClient({ initialRoom, roomId }: Props) {
             <Card className="bg-white/10 backdrop-blur-sm border-white/20 text-white">
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <Send className="h-5 w-5" />
-                  Nouvelle Question
+                  <Send className="h-5 w-5" /> Nouvelle Question
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
+                <div>
+                  <Label htmlFor="question">Importer vos questions</Label>
+                  <Input
+                    id="question"
+                    type="file"
+                    accept=".json"
+                    onChange={handleFileUpload}
+                  />
+                </div>
                 <Select
                   onValueChange={(val) => {
                     const selected = jsonQuestions.find((q) => q.text === val);
@@ -402,8 +332,7 @@ export default function HostClient({ initialRoom, roomId }: Props) {
                   onClick={sendQuestion}
                   className="w-full bg-white text-orange-600 hover:bg-white/90"
                 >
-                  <Send className="h-4 w-4 mr-2" />
-                  Envoyer la Question
+                  <Send className="h-4 w-4 mr-2" /> Envoyer la Question
                 </Button>
               </CardContent>
             </Card>
@@ -412,8 +341,7 @@ export default function HostClient({ initialRoom, roomId }: Props) {
               <Card className="bg-white/10 backdrop-blur-sm border-white/20 text-white">
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
-                    <CheckCircle className="h-5 w-5" />
-                    Question en cours
+                    <CheckCircle className="h-5 w-5" /> Question en cours
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-4">
@@ -427,7 +355,6 @@ export default function HostClient({ initialRoom, roomId }: Props) {
                       </p>
                     )}
                   </div>
-
                   <div className="space-y-2">
                     <h4 className="font-medium text-white/90">
                       Réponses reçues ({answers.length})
@@ -452,10 +379,10 @@ export default function HostClient({ initialRoom, roomId }: Props) {
                                 {answer.player?.pseudo}
                               </div>
                               <div className="text-white/80">
-                                &quot;{answer.text}&quot;
+                                "{answer.text}"
                               </div>
                               <div className="text-xs text-white/60 flex items-center gap-1">
-                                <Clock className="h-3 w-3" />
+                                <Clock className="h-3 w-3" />{" "}
                                 {answer.response_time}ms
                               </div>
                             </div>
@@ -481,18 +408,14 @@ export default function HostClient({ initialRoom, roomId }: Props) {
               </Card>
             )}
             {isGameEnded && (
-              <Button onClick={() => router.push("/")}>
-                Revenir au menu
-              </Button>
+              <Button onClick={() => router.push("/")}>Revenir au menu</Button>
             )}
           </div>
-
           <div className="space-y-6">
             <Card className="bg-white/10 backdrop-blur-sm border-white/20 text-white">
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <Users className="h-5 w-5" />
-                  Joueurs ({players.length})
+                  <Users className="h-5 w-5" /> Joueurs ({players.length})
                 </CardTitle>
               </CardHeader>
               <CardContent>
